@@ -17,7 +17,9 @@ import threading
 import sys
 from econ_calendar import is_major_event_ongoing
 from alerts import send_console_alert
+import warnings
 
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*Downcasting object dtype arrays.*')
 TRADING_HOURS = {
     'stocks': {'start': '09:30', 'end': '16:00'},  
     'forex': {'start': '00:00', 'end': '23:59'},   
@@ -1167,7 +1169,7 @@ def apply_ta(df, asset_type, volume_col=None):
     return df
 def train_model_from_data(asset_type, sentiment_df):
     """
-    Train River LogisticRegression on full historical data.
+    Train River LogisticRegression on full historical data and update model with live data.
     """
     cfg = {
         'crypto': {'file': CSV_FILES['crypto'], 'time_col': 'event_time', 'volume_col': 'volume_base', 'symbol_col': 'symbol', 'price_col': 'close'},
@@ -1176,19 +1178,15 @@ def train_model_from_data(asset_type, sentiment_df):
     }
     
     if asset_type not in cfg:
-        print(f"Unknown asset type: {asset_type}")
-        return None, None
+        return
     
     cfg = cfg[asset_type]
     df = load_data(asset_type, full_history=True)
     
     if df.empty:
-        print(f"No {asset_type} data for training.")
-        return None, None
-    
+        return
     
     df = apply_ta(df, asset_type, cfg['volume_col'])
-    
     
     df['date'] = pd.to_datetime(df[cfg['time_col']]).dt.date
     
@@ -1205,8 +1203,7 @@ def train_model_from_data(asset_type, sentiment_df):
     df = df.dropna(subset=['target'])
     
     if df.empty:
-        return None, None
-    
+        return
     
     excluded = [
         cfg['time_col'], cfg['symbol_col'], 'open', 'high', 'low', cfg['price_col'], 
@@ -1214,30 +1211,25 @@ def train_model_from_data(asset_type, sentiment_df):
         'name', 'base', 'quote'
     ]
     
-    
     expected_ta_columns = [
         'RSI', 'MACD', 'MACD_signal', 'MACD_histogram', 'SMA50', 'EMA20', 
         'ADX', 'DMP', 'DMN', 'ATR', 'OBV', 'CMF', 'sentiment_score'
     ]
     
-    
     feature_columns = []
     for col in expected_ta_columns:
-        if col in df.columns and col not in excluded:
+        if col in df.columns:
             feature_columns.append(col)
-    
     
     df[feature_columns] = df[feature_columns].apply(pd.to_numeric, errors='coerce').fillna(0)
     
-    
     model = preprocessing.StandardScaler() | linear_model.LogisticRegression()
     
+    # Continuous learning from live data
     for _, row in df.iterrows():
-        X = {col: row[col] for col in feature_columns}
-        y = row['target']
-        model.learn_one(X, y)
+        model.learn_one(row[feature_columns].to_dict(), row['target'])
     
-    print(f"Trained {asset_type} model on {len(df)} samples with {len(feature_columns)} features.")
+    print(f" Initial training completed for {asset_type}: {len(df)} samples, {len(feature_columns)} features")
     return model, feature_columns
 def get_latest_features(asset_type, sentiment_df):
     """
@@ -1317,7 +1309,160 @@ def get_latest_features(asset_type, sentiment_df):
     return latest_dict, valid_features
 
 
-
+def incremental_model_update(models, feature_columns, asset_type, sentiment_df):
+    """Update models incrementally with new data every 60 seconds - FIXED VERSION"""
+    if asset_type not in models:
+        return models, feature_columns
+    
+    try:
+        # Load only recent data (last 2 hours for efficiency)
+        df = load_data(asset_type, lookback_hours=2)
+        if df.empty:
+            return models, feature_columns
+        
+        # Apply technical indicators
+        cfg = {
+            'crypto': {'time_col': 'event_time', 'volume_col': 'volume_base', 'symbol_col': 'symbol', 'price_col': 'close'},
+            'stocks': {'time_col': 'timestamp', 'volume_col': 'volume', 'symbol_col': 'ticker', 'price_col': 'close'},
+            'forex': {'time_col': 'timestamp', 'volume_col': None, 'symbol_col': 'pair', 'price_col': 'rate'}
+        }
+        
+        if asset_type not in cfg:
+            return models, feature_columns
+            
+        cfg = cfg[asset_type]
+        df = apply_ta(df, asset_type, cfg['volume_col'])
+        
+        # Add sentiment data
+        try:
+            df['date'] = df[cfg['time_col']].dt.date
+            if not sentiment_df.empty:
+                sentiment_df_copy = sentiment_df.copy()
+                sentiment_df_copy['publishedAt'] = pd.to_datetime(sentiment_df_copy['publishedAt'], errors='coerce', utc=True)
+                sentiment_df_copy['date'] = sentiment_df_copy['publishedAt'].dt.date
+                daily_sent = sentiment_df_copy.groupby('date')['sentiment_score'].mean().reset_index()
+                df = pd.merge(df, daily_sent, on='date', how='left')
+                df['sentiment_score'] = df['sentiment_score'].fillna(0)
+            else:
+                df['sentiment_score'] = 0
+        except Exception as e:
+            print(f" Error adding sentiment in incremental learning for {asset_type}: {e}")
+            df['sentiment_score'] = 0
+        
+        # Create target variable
+        df['target'] = (df[cfg['price_col']].shift(-1) > df[cfg['price_col']]).astype(int)
+        df = df.dropna(subset=['target'])
+        
+        if df.empty:
+            return models, feature_columns
+        
+        # Get the feature columns that the model was originally trained with
+        expected_features = feature_columns.get(asset_type, [])
+        if not expected_features:
+            return models, feature_columns
+        
+        # Incremental learning on new data
+        learning_samples = 0
+        for _, row in df.iterrows():
+            try:
+                features = {}
+                for col in expected_features:
+                    if col in df.columns and pd.notna(row[col]):
+                        features[col] = float(row[col])
+                    else:
+                        features[col] = 0.0
+                
+                if features:  # Only learn if we have valid features
+                    models[asset_type].learn_one(features, row['target'])
+                    learning_samples += 1
+                    
+            except Exception as e:
+                continue  # Skip problematic rows
+        
+        if learning_samples > 0:
+            print(f" Incrementally learned {learning_samples} new samples for {asset_type}")
+        
+        return models, feature_columns
+        
+    except Exception as e:
+        print(f" Error in incremental learning for {asset_type}: {e}")
+        return models, feature_columns  
+        """Update models incrementally with new data every 60 seconds"""
+    if asset_type not in models:
+        return models, feature_columns
+    
+    # Load only recent data (last 2 hours for efficiency)
+    df = load_data(asset_type, lookback_hours=2)
+    if df.empty:
+        return models, feature_columns
+    
+    # Apply technical indicators
+    cfg = {
+        'crypto': {'time_col': 'event_time', 'volume_col': 'volume_base', 'symbol_col': 'symbol', 'price_col': 'close'},
+        'stocks': {'time_col': 'timestamp', 'volume_col': 'volume', 'symbol_col': 'ticker', 'price_col': 'close'},
+        'forex': {'time_col': 'timestamp', 'volume_col': None, 'symbol_col': 'pair', 'price_col': 'rate'}
+    }
+    
+    if asset_type not in cfg:
+        return models, feature_columns
+        
+    cfg = cfg[asset_type]
+    df = apply_ta(df, asset_type, cfg['volume_col'])
+    
+    # Add sentiment data
+    try:
+        df['date'] = df[cfg['time_col']].dt.date
+        if not sentiment_df.empty:
+            sentiment_df_copy = sentiment_df.copy()
+            sentiment_df_copy['publishedAt'] = pd.to_datetime(sentiment_df_copy['publishedAt'], errors='coerce', utc=True)
+            sentiment_df_copy['date'] = sentiment_df_copy['publishedAt'].dt.date
+            daily_sent = sentiment_df_copy.groupby('date')['sentiment_score'].mean().reset_index()
+            df = pd.merge(df, daily_sent, on='date', how='left')
+            df['sentiment_score'] = df['sentiment_score'].fillna(0)
+        else:
+            df['sentiment_score'] = 0
+    except Exception as e:
+        print(f" Error adding sentiment in incremental learning for {asset_type}: {e}")
+        df['sentiment_score'] = 0
+    
+    # Create target variable
+    df['target'] = (df[cfg['price_col']].shift(-1) > df[cfg['price_col']]).astype(int)
+    df = df.dropna(subset=['target'])
+    
+    if df.empty:
+        return models, feature_columns
+    
+    # Define feature columns (same as in training)
+    excluded_columns = [
+        cfg['time_col'], cfg['symbol_col'], 'open', 'high', 'low', cfg['price_col'], 
+        'volume', 'volume_base', 'volume_quote', 'date', 'target', 'pip_value', 
+        'name', 'base', 'quote'
+    ]
+    
+    feature_cols = [col for col in df.columns if col not in excluded_columns and col in feature_columns.get(asset_type, [])]
+    
+    # Incremental learning on new data
+    learning_samples = 0
+    for _, row in df.iterrows():
+        try:
+            features = {}
+            for col in feature_cols:
+                if col in row and pd.notna(row[col]):
+                    features[col] = float(row[col])
+                else:
+                    features[col] = 0.0
+            
+            if features:  # Only learn if we have valid features
+                models[asset_type].learn_one(features, row['target'])
+                learning_samples += 1
+                
+        except Exception as e:
+            continue  # Skip problematic rows
+    
+    if learning_samples > 0:
+        print(f" Incrementally learned {learning_samples} new samples for {asset_type}")
+    
+    return models, feature_columns
 def generate_signal(model, feature_columns, sentiment_df, asset_type, current_price, symbol=None):
     """
     Generate signal, probs, TP/SL in pips/points, suggested volume.
@@ -1887,6 +2032,7 @@ def display_dashboard(models, feature_columns, sentiment_df):
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 80)
     print(f"TRADING DASHBOARD - Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
     print("=" * 80)
     
     
@@ -1957,6 +2103,7 @@ def display_dashboard(models, feature_columns, sentiment_df):
 
     print("\n TRADING SIGNALS (Model Predictions)")
     print("-" * 80)
+    print(" [Models actively learning every 60s with latest data]")
     balance = summary['balance']
     for asset_type in ['crypto', 'stocks', 'forex']:
         model = models.get(asset_type)
@@ -2166,7 +2313,7 @@ def enhanced_main_loop():
     sentiment_df = refresh_sentiment()
     
     
-    print("Training models...")
+    print("Initial training models...")
     models = {}
     feature_columns = {}
     for asset_type in ['crypto', 'stocks', 'forex']:
@@ -2174,6 +2321,7 @@ def enhanced_main_loop():
         if model:
             models[asset_type] = model
             feature_columns[asset_type] = cols
+            print(f" Initial {asset_type} model trained with {len(cols)} features")
         else:
             print(f"Skipping {asset_type} model (no data).")
     
@@ -2206,6 +2354,16 @@ def enhanced_main_loop():
                 print("Refreshing sentiment...")
                 sentiment_df = refresh_sentiment()
                 last_sentiment_refresh = time.time()
+            
+            
+            # ========== ADD INCREMENTAL LEARNING HERE ==========
+            print(" Updating models with latest data...")
+            for asset_type in ['crypto', 'stocks', 'forex']:
+                if asset_type in models:  # Only update if model exists
+                    models, feature_columns = incremental_model_update(
+                        models, feature_columns, asset_type, sentiment_df
+                    )
+            # ========== END INCREMENTAL LEARNING ==========
             
             
             prices = get_latest_prices()
@@ -2245,7 +2403,7 @@ def enhanced_main_loop():
                     continue
                     
                 current_price = latest_item.get('price') or latest_item.get('rate')
-                symbol = latest_item.get('symbol') or latest_item.get('ticker') or latest_item.get('pair')
+                symbol = latest_item.get('symbol') or latest_item.get('ticker' if asset_type == 'stocks' else 'pair')
                 
                 if not current_price or not symbol:
                     continue
@@ -2271,8 +2429,7 @@ def enhanced_main_loop():
             
             display_dashboard(models, feature_columns, sentiment_df)
             
-            time.sleep(60)
-            
+            time.sleep(60)   
     except KeyboardInterrupt:
         print("\n Shutdown requested by user...")
     except Exception as e:
@@ -2339,7 +2496,6 @@ def perform_system_health_check():
     except Exception as e:
         print(f" Health check failed: {e}")
         return False  
-
 
 
 
