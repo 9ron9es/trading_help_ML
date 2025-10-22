@@ -1,0 +1,8 @@
+data_dir: /home/adem/ai/data
+model_dir: /home/adem/ai/models
+metrics_file: /home/adem/ai/metrics.json
+trust_days: 30
+metric_name: accuracy
+metric_threshold: 0.90
+schedule_hours: 24
+label_column: label
