@@ -82,7 +82,8 @@ major_forex_pairs = {
     "GBP/JPY": {"name": "British Pound / Japanese Yen", "pip_value": 0.01}
     
 }
-
+MAX_TRADE_DURATION_HOURS = 4
+FOREX_ATR_MULTIPLIER = 1.0    
 
 
 class AdvancedRiskManager:
@@ -1076,72 +1077,85 @@ def get_latest_prices():
 
 def apply_ta(df, asset_type, volume_col=None):
     """
-    Apply technical indicators using pandas_ta with proper column handling.
+    Apply technical indicators using pandas_ta with proper column handling
+    and ASSET-SPECIFIC ATR sanity checks.
     """
     if df.empty:
         return df
     
     df = df.copy()
     
-    
+    # Handle different asset types
     if asset_type == 'forex':
         df['open'] = df['high'] = df['low'] = df['close'] = df['rate']
         volume_col = None  
     
-    
+    # Ensure we have a close column
     if 'close' not in df.columns:
         df['close'] = df.get('rate', df.get('price', 0))
         print(f"Warning: No 'close' column in {asset_type} data; using fallback.")
     
-    
+    # RSI
     df['RSI'] = pta.rsi(df['close'], length=14)
     
-    
+    # MACD
     try:
         macd_data = pta.macd(df['close'], fast=12, slow=26, signal=9)
         if macd_data is not None and not macd_data.empty:
-            
             macd_data = macd_data.rename(columns={
                 'MACD_12_26_9': 'MACD',
                 'MACDs_12_26_9': 'MACD_signal', 
                 'MACDh_12_26_9': 'MACD_histogram'
             })
-            
             df = pd.concat([df, macd_data], axis=1)
     except Exception as e:
         print(f"MACD calculation error: {e}")
-        
         df['MACD'] = 0.0
         df['MACD_signal'] = 0.0
         df['MACD_histogram'] = 0.0
     
-    
+    # Moving averages
     df['SMA50'] = pta.sma(df['close'], length=50)
     df['EMA20'] = pta.ema(df['close'], length=20)
     
-    
+    # ADX
     try:
         adx_data = pta.adx(df['high'], df['low'], df['close'], length=14)
         if adx_data is not None and not adx_data.empty:
-            
             adx_data = adx_data.rename(columns={
                 'ADX_14': 'ADX',
                 'DMP_14': 'DMP',
                 'DMN_14': 'DMN'
             })
-            
             df = pd.concat([df, adx_data], axis=1)
     except Exception as e:
         print(f"ADX calculation error: {e}")
-        
         df['ADX'] = 0.0
         df['DMP'] = 0.0
         df['DMN'] = 0.0
     
-    
+    # ATR
     df['ATR'] = pta.atr(df['high'], df['low'], df['close'], length=14)
     
+    # FIXED: ASSET-SPECIFIC ATR SANITY CHECKS
+    if 'ATR' in df.columns:
+        if asset_type == 'forex':
+            # Forex: typically 0.0005-0.015 (5-150 pips)
+            max_reasonable_atr = 0.020  # 200 pips maximum
+            df['ATR'] = df['ATR'].clip(upper=max_reasonable_atr)
+            
+        elif asset_type == 'crypto':
+            # Crypto: can be more volatile, but cap at 20% of price
+            # FIX: Create a temporary column for the comparison
+            max_reasonable_atr = df['close'] * 0.20
+            df['ATR'] = np.where(df['ATR'] > max_reasonable_atr, max_reasonable_atr, df['ATR'])
+            
+        else:  # stocks
+            # Stocks: cap at 15% of price
+            max_reasonable_atr = df['close'] * 0.15
+            df['ATR'] = np.where(df['ATR'] > max_reasonable_atr, max_reasonable_atr, df['ATR'])
     
+    # Volume indicators (if volume data available)
     if volume_col and volume_col in df.columns and not df[volume_col].isna().all():
         try:
             df['OBV'] = pta.obv(df['close'], df[volume_col])
@@ -1154,7 +1168,7 @@ def apply_ta(df, asset_type, volume_col=None):
         df['OBV'] = 0.0
         df['CMF'] = 0.0
     
-    
+    # Fill NaN values for all TA columns
     ta_columns = [
         'RSI', 'MACD', 'MACD_signal', 'MACD_histogram', 'SMA50', 'EMA20', 
         'ADX', 'DMP', 'DMN', 'ATR', 'OBV', 'CMF'
@@ -1164,7 +1178,7 @@ def apply_ta(df, asset_type, volume_col=None):
         if col in df.columns:
             df[col] = df[col].fillna(0.0)
         else:
-            df[col] = 0.0  
+            df[col] = 0.0
     
     return df
 def train_model_from_data(asset_type, sentiment_df):
@@ -1465,67 +1479,249 @@ def incremental_model_update(models, feature_columns, asset_type, sentiment_df):
     return models, feature_columns
 def generate_signal(model, feature_columns, sentiment_df, asset_type, current_price, symbol=None):
     """
-    Generate signal, probs, TP/SL in pips/points, suggested volume.
-    Uses latest features for prediction.
+    Generate signal with PROPER pip/point calculations for ALL asset types
+    AND TIGHTER STOPS FOR FOREX
     """
-    if not model:
+    if not model or not feature_columns:
         return "HOLD", 0.5, 0.5, None, None, None, 0.0
+        
     latest_row, valid_features = get_latest_features(asset_type, sentiment_df)
     if not valid_features:
         return "HOLD", 0.5, 0.5, None, None, None, 0.0
-    X_new = {k: latest_row.get(k, 0) for k in feature_columns if k in valid_features}
+
+    X_new = {k: latest_row.get(k, 0.0) for k in feature_columns if k in valid_features}
     prediction = model.predict_proba_one(X_new)
     prob_up = prediction.get(1, 0.5)
     prob_down = prediction.get(0, 0.5)
-    atr = latest_row.get('ATR', 0.01)  
-    if atr == 0:
-        atr = 0.01 * current_price  
+    
+    atr = latest_row.get('ATR', 0.01)
+    if atr <= 0:
+        # Asset-specific default ATR values
+        if asset_type == 'forex':
+            atr = 0.005 * current_price  # ~50 pips default
+        elif asset_type == 'crypto':
+            atr = 0.02 * current_price   # 2% default for crypto
+        else:  # stocks
+            atr = 0.01 * current_price   # 1% default for stocks
     
     signal = "HOLD"
-    sl_distance = None
+    sl_distance = None  
     tp_distance = None
+    
+    # USE TIGHTER SL FOR FOREX
+    if asset_type == 'forex':
+        atr_multiplier = FOREX_ATR_MULTIPLIER
+    else:
+        atr_multiplier = ATR_MULTIPLIER_SL
+    
     if prob_up > 0.6:
         signal = "BUY"
-        sl_distance = ATR_MULTIPLIER_SL * atr
-        tp_distance = sl_distance * REWARD_RISK_RATIO
+        sl_distance = atr_multiplier * atr  
+        tp_distance = sl_distance * REWARD_RISK_RATIO  
     elif prob_down > 0.6:
         signal = "SELL"
-        sl_distance = ATR_MULTIPLIER_SL * atr
-        tp_distance = sl_distance * REWARD_RISK_RATIO
-    if signal == "HOLD" or sl_distance is None:
+        sl_distance = atr_multiplier * atr  
+        tp_distance = sl_distance * REWARD_RISK_RATIO  
+        
+    if signal == "HOLD" or sl_distance is None or sl_distance <= 0:
         return signal, prob_up, prob_down, None, None, None, atr
     
-    pair_info = get_pair_info(symbol) if asset_type == 'forex' and symbol else {"pip_value": PIP_VALUE_DEFAULT}
-    pip_value = pair_info['pip_value']
-    sl_pips = sl_distance / pip_value if pip_value > 0 else sl_distance / (0.01 * current_price)  
-    tp_pips = tp_distance / pip_value if pip_value > 0 else tp_distance / (0.01 * current_price)
+    # ASSET-SPECIFIC PIP/POINT CALCULATIONS
+    if asset_type == 'forex':
+        pair_info = get_pair_info(symbol) if symbol else {"pip_value": PIP_VALUE_DEFAULT}
+        pip_value = pair_info['pip_value']
+        sl_pips = sl_distance / pip_value
+        tp_pips = tp_distance / pip_value
+        
+        # TIGHTER Forex-specific limits
+        MAX_SL_PIPS = 80   # Reduced from 200
+        MIN_SL_PIPS = 15   # Increased from 10
+        
+    elif asset_type == 'crypto':
+        # Crypto: use percentage points (1 point = 1% of price)
+        point_value = current_price * 0.01
+        sl_pips = sl_distance / point_value  # Actually "points" for crypto
+        tp_pips = tp_distance / point_value
+        
+        # Crypto-specific limits
+        MAX_SL_PIPS = 50   # 50% max stop loss
+        MIN_SL_PIPS = 1    # 1% min stop loss
+        
+    else:  # stocks
+        # Stocks: use cents/points (1 point = $0.01 for most stocks)
+        point_value = 0.01
+        sl_pips = sl_distance / point_value  # Actually "cents" for stocks
+        tp_pips = tp_distance / point_value
+        
+        # Stock-specific limits  
+        MAX_SL_PIPS = 500   # $5.00 max stop loss
+        MIN_SL_PIPS = 10    # $0.10 min stop loss
+    
+    # UNIVERSAL SANITY CHECKS
+    if sl_pips > MAX_SL_PIPS:
+        print(f"SL too large ({sl_pips:.1f} {'pips' if asset_type == 'forex' else 'points'}) for {symbol}; adjusting to {MAX_SL_PIPS}")
+        sl_pips = MAX_SL_PIPS
+        tp_pips = sl_pips * REWARD_RISK_RATIO
+    
     if sl_pips < MIN_SL_PIPS:
-        print(f"SL too small ({sl_pips:.1f} pips) for {symbol}; skipping signal.")
+        print(f"SL too small ({sl_pips:.1f} {'pips' if asset_type == 'forex' else 'points'}) for {symbol}; holding.")
         return "HOLD", prob_up, prob_down, None, None, None, atr
     
-    volume = None  
+    volume = None
     return signal, prob_up, prob_down, tp_pips, sl_pips, volume, atr
+
+def check_trade_timeouts(prices):
+    """Close trades that have been open too long"""
+    trades = load_open_trades()
+    if not trades:
+        return
+        
+    history = load_trade_history()
+    balance, total_trades, wins, total_pnl = load_account_state()
+    closed_any = False
+    
+    for trade in trades[:]:
+        if trade['status'] != 'open':
+            continue
+            
+        open_time = datetime.fromisoformat(trade['open_time'])
+        hours_open = (datetime.now() - open_time).total_seconds() / 3600
+        
+        if hours_open > MAX_TRADE_DURATION_HOURS:
+            # Force close at current price
+            asset_type = trade['asset_type']
+            symbol = trade['symbol']
+            current_price = None
+            
+            # Find current price
+            if asset_type == 'forex' and prices.get('forex'):
+                for p in prices['forex']:
+                    if p['pair'] == symbol:
+                        current_price = p['rate']
+                        break
+            elif asset_type == 'crypto' and prices.get('crypto'):
+                for p in prices['crypto']:
+                    if p['symbol'] == symbol:
+                        current_price = p['price']
+                        break
+            elif asset_type == 'stocks' and prices.get('stocks'):
+                for p in prices['stocks']:
+                    if p['ticker'] == symbol:
+                        current_price = p['price']
+                        break
+            
+            if current_price:
+                # Calculate P&L for timeout close
+                entry = trade['entry']
+                volume = trade['volume']
+                signal = trade['signal']
+                
+                if signal == "BUY":
+                    pnl_usd = (current_price - entry) * volume
+                else:
+                    pnl_usd = (entry - current_price) * volume
+                
+                # Forex-specific P&L calculation
+                if asset_type == 'forex':
+                    pair_info = get_pair_info(symbol)
+                    pip_value = pair_info['pip_value']
+                    pips = abs(current_price - entry) / pip_value
+                    usd_per_pip_per_lot = 10.0
+                    pnl_usd = pips * volume * usd_per_pip_per_lot
+                    if signal == "SELL":
+                        pnl_usd = -pnl_usd
+                
+                # Update account
+                balance += pnl_usd
+                total_trades += 1
+                if pnl_usd > 0:
+                    wins += 1
+                total_pnl += pnl_usd
+                
+                # Close trade
+                trade['status'] = 'closed'
+                trade['exit_price'] = current_price
+                trade['pips'] = abs(current_price - entry) / pip_value if asset_type == 'forex' else 0
+                trade['pnl_usd'] = round(pnl_usd, 2)
+                trade['exit_time'] = datetime.now().isoformat()
+                trade['hit_tp'] = False
+                trade['timeout'] = True
+                trade['verdict'] = trade_verdict_text(pnl_usd)
+                
+                history.append(trade)
+                trades.remove(trade)
+                closed_any = True
+                
+                print(f"⏰ TIMEOUT CLOSE: {signal} {symbol} after {hours_open:.1f}h, P&L: ${pnl_usd:.2f}")
+    
+    if closed_any:
+        save_open_trades(trades)
+        save_trade_history(history)
+        save_account_state(balance, total_trades, wins, total_pnl)
+
+
+
+def should_trade_forex(symbol, model, feature_columns, sentiment_df, current_price):
+    """Additional filters specifically for forex trading"""
+    
+    # Load recent data for the pair
+    df = load_data('forex', 24)
+    if df.empty:
+        return False, "No data"
+    
+    pair_data = df[df['pair'] == symbol]
+    if len(pair_data) < 20:  # Need sufficient data
+        return False, "Insufficient data"
+    
+    # Apply TA
+    pair_data = apply_ta(pair_data, 'forex')
+    
+    # Get latest features for prediction
+    latest_row, valid_features = get_latest_features('forex', sentiment_df)
+    if not valid_features:
+        return False, "No valid features"
+    
+    # Stronger signal threshold for forex
+    X_new = {k: latest_row.get(k, 0.0) for k in feature_columns if k in valid_features}
+    prediction = model.predict_proba_one(X_new)
+    prob_up = prediction.get(1, 0.5)
+    prob_down = prediction.get(0, 0.5)
+    
+    # Require stronger conviction for forex
+    min_confidence = 0.65  # Higher threshold
+    if prob_up < min_confidence and prob_down < min_confidence:
+        return False, f"Low confidence (UP: {prob_up:.2f}, DOWN: {prob_down:.2f})"
+    
+    # Check if price is near recent highs/lows (avoid choppy areas)
+    recent_high = pair_data['rate'].tail(20).max()
+    recent_low = pair_data['rate'].tail(20).min()
+    current_range_position = (current_price - recent_low) / (recent_high - recent_low)
+    
+    # Avoid trading at extremes
+    if current_range_position > 0.8 or current_range_position < 0.2:
+        return False, f"At range extreme ({current_range_position:.2f})"
+    
+    return True, "OK"
+
 
 def calculate_position_size(asset_type, signal, current_price, sl_pips, balance, symbol=None):
     """
-    Enhanced position sizing with multiple safety checks
+    Calculate position size with asset-specific risk calculations
     """
-    if balance <= 100:  
+    if balance <= 100:
+        print("Balance too low; no new positions.")
         return 0
-    
-    
+        
+    # REJECT ABSURD VALUES ACROSS ALL ASSETS
+    if sl_pips > 10000:  # Catch any remaining crazy values
+        print(f"Rejecting trade: SL unreasonable ({sl_pips:.1f})")
+        return 0
+        
     risk_usd = balance * RISK_PER_TRADE
     
-    
-    volatility_factor = get_volatility_adjustment(asset_type, symbol)
-    risk_usd *= volatility_factor
-    
-    pair_info = get_pair_info(symbol) if asset_type == 'forex' and symbol else {"pip_value": PIP_VALUE_DEFAULT}
-    pip_value = pair_info['pip_value']
-    
     if asset_type == 'forex':
-        
-        usd_per_pip_per_full_lot = 10.0
+        # Forex: lot size calculation
+        usd_per_pip_per_full_lot = 10.0  
         sl_risk_per_full_lot = sl_pips * usd_per_pip_per_full_lot
         
         if sl_risk_per_full_lot <= 0:
@@ -1533,30 +1729,48 @@ def calculate_position_size(asset_type, signal, current_price, sl_pips, balance,
             
         lot_size = risk_usd / sl_risk_per_full_lot
         
-        
+        # Reasonable lot size limits
         min_lot = 0.01
-        max_lot = min(10.0, balance / 1000)  
+        max_lot = min(5.0, balance / 1000)
         
         lot_size = max(min_lot, min(lot_size, max_lot))
         return round(lot_size, 2)
         
-    else:
-        
-        point_value = pip_value * current_price if pip_value > 0 else current_price * 0.01
-        
+    elif asset_type == 'crypto':
+        # Crypto: quantity calculation using percentage points
+        point_value = current_price * 0.01  # 1 point = 1% of price
         sl_price_distance = sl_pips * point_value
+        
         if sl_price_distance <= 0:
             return 0
             
         quantity = risk_usd / sl_price_distance
         
+        # Crypto-specific position limits
+        max_affordable = (balance * 0.2) / current_price  # Max 20% of account
+        min_quantity = 0.001  # Minimum crypto quantity
         
-        max_affordable = (balance * 0.1) / current_price  
         quantity = min(quantity, max_affordable)
-        quantity = max(1, int(quantity))
+        quantity = max(min_quantity, quantity)
+        return round(quantity, 6)  # Crypto precision
         
-        return quantity if quantity > 0 else 0
-
+    else:  # stocks
+        # Stocks: share quantity calculation using cents
+        point_value = 0.01  # 1 point = $0.01
+        sl_price_distance = sl_pips * point_value
+        
+        if sl_price_distance <= 0:
+            return 0
+            
+        quantity = risk_usd / sl_price_distance
+        
+        # Stock-specific position limits
+        max_affordable = (balance * 0.15) / current_price  # Max 15% of account
+        min_quantity = 1  # Whole shares only
+        
+        quantity = min(quantity, max_affordable)
+        quantity = max(min_quantity, int(quantity))  # Whole shares
+        return quantity
 def get_volatility_adjustment(asset_type, symbol=None):
     """Reduce position size during high volatility"""
     try:
@@ -1815,7 +2029,6 @@ def trade_verdict_text(pnl_usd):
     return "Mixed"
     
     
-
 
 def check_trade_exits(prices):
     """Check all open trades for TP/SL hits using live prices. Update balance/P&L."""
@@ -2278,6 +2491,487 @@ performance_monitor = PerformanceMonitor()
 
 
 
+# Add this enhanced user interaction system above the enhanced_main_loop function
+
+class UserTradingProfile:
+    def __init__(self):
+        self.balance = ACCOUNT_BALANCE_START
+        self.profit_target_percent = 5.0
+        self.loss_target_percent = 2.0
+        self.risk_level = "medium"  # low, medium, high
+        self.trading_style = "standard"  # standard, scalping
+        self.manual_approval = True
+        self.approved_trades = []
+        self.delete_history = False
+        self.scalping_duration = 5  # minutes for scalping trades
+        self.position_sizes = {
+            "low": 0.5,    # 0.5% risk per trade
+            "medium": 1.0, # 1.0% risk per trade  
+            "high": 2.0    # 2.0% risk per trade
+        }
+    
+    def calculate_dynamic_risk(self):
+        """Calculate risk parameters based on user profile"""
+        risk_multiplier = {
+            "low": 0.5,
+            "medium": 1.0,
+            "high": 1.5
+        }
+        return risk_multiplier.get(self.risk_level, 1.0)
+
+def enhanced_user_setup():
+    """Comprehensive user setup with risk profiling"""
+    profile = UserTradingProfile()
+    
+    print("\n" + "="*60)
+    print("ENHANCED TRADING PROFILE SETUP")
+    print("="*60)
+    
+    # Account Balance
+    while True:
+        try:
+            balance_input = input("\nEnter your account balance ($): ").strip()
+            if not balance_input:
+                print("Using default balance: $10,000")
+                profile.balance = ACCOUNT_BALANCE_START
+                break
+            profile.balance = float(balance_input)
+            if profile.balance <= 0:
+                print("Please enter a positive balance.")
+                continue
+            if profile.balance < 100:
+                print("Warning: Balance below $100 may limit trading opportunities.")
+            break
+        except ValueError:
+            print("Invalid input. Please enter a numeric value.")
+    
+    # Profit Target
+    while True:
+        try:
+            profit_input = input("\nEnter your desired profit target (% per month): ").strip()
+            if not profit_input:
+                print("Using default: 5% monthly target")
+                profile.profit_target_percent = 5.0
+                break
+            profile.profit_target_percent = float(profit_input)
+            if profile.profit_target_percent <= 0:
+                print("Please enter a positive target.")
+                continue
+            if profile.profit_target_percent > 50:
+                print("Warning: Target above 50% is very aggressive.")
+            break
+        except ValueError:
+            print("Invalid input. Please enter a numeric value.")
+    
+    # Loss Tolerance
+    while True:
+        try:
+            loss_input = input("\nEnter your maximum acceptable loss (% of account): ").strip()
+            if not loss_input:
+                print("Using default: 2% maximum loss")
+                profile.loss_target_percent = 2.0
+                break
+            profile.loss_target_percent = float(loss_input)
+            if profile.loss_target_percent <= 0:
+                print("Please enter a positive value.")
+                continue
+            if profile.loss_target_percent > 25:
+                print("Warning: Loss tolerance above 25% is extremely high risk.")
+            break
+        except ValueError:
+            print("Invalid input. Please enter a numeric value.")
+    
+    # Risk Level
+    print("\nSelect your risk level:")
+    print("1. LOW (Conservative) - 0.5% risk per trade")
+    print("2. MEDIUM (Balanced) - 1.0% risk per trade") 
+    print("3. HIGH (Aggressive) - 2.0% risk per trade")
+    
+    while True:
+        risk_choice = input("\nEnter choice (1-3): ").strip()
+        if risk_choice == "1":
+            profile.risk_level = "low"
+            break
+        elif risk_choice == "2":
+            profile.risk_level = "medium" 
+            break
+        elif risk_choice == "3":
+            profile.risk_level = "high"
+            break
+        elif not risk_choice:
+            profile.risk_level = "medium"
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    # Trading Style
+    print("\nSelect your trading style:")
+    print("1. STANDARD (4-hour max trades)")
+    print("2. SCALPING (5-minute max trades)")
+    
+    while True:
+        style_choice = input("\nEnter choice (1-2): ").strip()
+        if style_choice == "1":
+            profile.trading_style = "standard"
+            break
+        elif style_choice == "2":
+            profile.trading_style = "scalping"
+            # Adjust parameters for scalping
+            global MAX_TRADE_DURATION_HOURS
+            MAX_TRADE_DURATION_HOURS = 0.083  # 5 minutes in hours
+            print("Scalping mode activated: 5-minute trade duration")
+            break
+        elif not style_choice:
+            profile.trading_style = "standard"
+            break
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+    
+    # Manual Approval
+    while True:
+        approval_input = input("\nRequire manual trade approval? (yes/no): ").strip().lower()
+        if approval_input in ['yes', 'y']:
+            profile.manual_approval = True
+            break
+        elif approval_input in ['no', 'n']:
+            profile.manual_approval = False
+            break
+        elif not approval_input:
+            profile.manual_approval = True
+            break
+        else:
+            print("Please enter 'yes' or 'no'.")
+    
+    # Pre-approved Trades
+    if profile.manual_approval:
+        print("\n=== PRE-APPROVED TRADES SETUP ===")
+        print("Enter symbols you want to pre-approve (comma-separated):")
+        print("Examples: BTCUSDT, AAPL, EUR/USD")
+        print("Leave empty for no pre-approvals")
+        
+        approved_input = input("\nPre-approved symbols: ").strip()
+        if approved_input:
+            profile.approved_trades = [symbol.strip().upper() for symbol in approved_input.split(',')]
+            print(f"Pre-approved trades: {', '.join(profile.approved_trades)}")
+    
+    # Delete History
+    while True:
+        history_input = input("\nDelete existing trade history? (yes/no): ").strip().lower()
+        if history_input in ['yes', 'y']:
+            profile.delete_history = True
+            break
+        elif history_input in ['no', 'n']:
+            profile.delete_history = False
+            break
+        elif not history_input:
+            profile.delete_history = False
+            break
+        else:
+            print("Please enter 'yes' or 'no'.")
+    
+    # Apply risk settings
+    global RISK_PER_TRADE
+    RISK_PER_TRADE = profile.position_sizes[profile.risk_level] / 100.0
+    
+    # Summary
+    print("\n" + "="*60)
+    print("PROFILE SUMMARY")
+    print("="*60)
+    print(f"Account Balance: ${profile.balance:,.2f}")
+    print(f"Monthly Target: {profile.profit_target_percent}%")
+    print(f"Max Loss Tolerance: {profile.loss_target_percent}%")
+    print(f"Risk Level: {profile.risk_level.upper()}")
+    print(f"Risk per Trade: {profile.position_sizes[profile.risk_level]}%")
+    print(f"Trading Style: {profile.trading_style.upper()}")
+    print(f"Manual Approval: {'YES' if profile.manual_approval else 'NO'}")
+    print(f"Pre-approved Symbols: {', '.join(profile.approved_trades) if profile.approved_trades else 'None'}")
+    print(f"Delete History: {'YES' if profile.delete_history else 'NO'}")
+    print("="*60)
+    
+    # Final confirmation
+    while True:
+        confirm = input("\nStart trading with these settings? (yes/no): ").strip().lower()
+        if confirm in ['yes', 'y']:
+            break
+        elif confirm in ['no', 'n']:
+            print("Restarting setup...")
+            return enhanced_user_setup()
+        else:
+            print("Please enter 'yes' or 'no'.")
+    
+    return profile
+
+def request_trade_approval(trade_signal, profile):
+    """Request user approval for a trade with detailed information"""
+    if not profile.manual_approval:
+        return True
+        
+    symbol = trade_signal['symbol']
+    
+    # Auto-approve if symbol is pre-approved
+    if symbol in profile.approved_trades:
+        print(f"✓ Auto-approved {symbol} (pre-approved)")
+        return True
+    
+    print(f"\n🔔 TRADE APPROVAL REQUESTED")
+    print("="*50)
+    print(f"SYMBOL: {symbol}")
+    print(f"SIGNAL: {trade_signal['signal']}")
+    print(f"ENTRY: {trade_signal['entry_price']:.5f}")
+    print(f"TP: {trade_signal['tp_price']:.5f}")
+    print(f"SL: {trade_signal['sl_price']:.5f}")
+    print(f"VOLUME: {trade_signal['volume']}")
+    print(f"RISK: ${trade_signal['risk_amount']:.2f}")
+    print(f"CONFIDENCE: {trade_signal['confidence']:.1%}")
+    print("="*50)
+    
+    while True:
+        approval = input("Approve this trade? (yes/no/skip): ").strip().lower()
+        if approval in ['yes', 'y']:
+            print("✓ Trade approved!")
+            return True
+        elif approval in ['no', 'n']:
+            print("✗ Trade rejected.")
+            return False
+        elif approval in ['skip', 's']:
+            print("⏭️ Trade skipped.")
+            return False
+        else:
+            print("Please enter 'yes', 'no', or 'skip'.")
+
+def apply_scalping_adjustments(profile):
+    """Adjust trading parameters for scalping mode"""
+    if profile.trading_style == "scalping":
+        # Tighter stops for scalping
+        global ATR_MULTIPLIER_SL, REWARD_RISK_RATIO, MIN_SL_PIPS
+        ATR_MULTIPLIER_SL = 1.0  # Tighter stops
+        REWARD_RISK_RATIO = 1.5  # Lower reward:risk for quicker trades
+        MIN_SL_PIPS = 5  # Smaller minimum stop loss
+        
+        print("Scalping adjustments applied:")
+        print(f"  - Tighter stops (ATR Multiplier: {ATR_MULTIPLIER_SL})")
+        print(f"  - Lower reward:risk ratio ({REWARD_RISK_RATIO}:1)")
+        print(f"  - Max trade duration: {profile.scalping_duration} minutes")
+
+def cleanup_old_data(profile):
+    """Clean up old data based on user preferences"""
+    if profile.delete_history:
+        files_to_clean = [TRADE_HISTORY_FILE, TRADE_FILE, ACCOUNT_STATE_FILE]
+        for file_path in files_to_clean:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted: {file_path}")
+                except Exception as e:
+                    print(f"Error deleting {file_path}: {e}")
+        
+        # Reset account state
+        save_account_state(profile.balance, 0, 0, 0.0)
+        print("Trade history cleared and account reset.")
+
+# Enhanced trade execution with user approval
+def execute_trade_with_approval(asset_type, symbol, signal, entry_price, tp_pips, sl_pips, volume, atr, profile):
+    """Enhanced trade execution with user approval system"""
+    
+    # Calculate trade details
+    pair_info = get_pair_info(symbol) if asset_type == 'forex' else {"pip_value": PIP_VALUE_DEFAULT}
+    pip_value = pair_info['pip_value']
+    
+    sl_distance = sl_pips * pip_value
+    tp_distance = tp_pips * pip_value
+    
+    if signal == "BUY":
+        sl_price = entry_price - sl_distance
+        tp_price = entry_price + tp_distance
+    else:  # SELL
+        sl_price = entry_price + sl_distance
+        tp_price = entry_price - tp_distance
+    
+    risk_amount = volume * sl_distance
+    
+    # Get model confidence
+    latest_features, _ = get_latest_features(asset_type, load_sentiment_data())
+    confidence = max(latest_features.get('RSI', 0.5) / 100.0, 0.5)  # Simplified confidence
+    
+    trade_signal = {
+        'symbol': symbol,
+        'signal': signal,
+        'entry_price': entry_price,
+        'tp_price': tp_price,
+        'sl_price': sl_price,
+        'volume': volume,
+        'risk_amount': risk_amount,
+        'confidence': confidence,
+        'asset_type': asset_type
+    }
+    
+    # Request approval
+    if not request_trade_approval(trade_signal, profile):
+        return None
+    
+    # Execute the trade
+    return execute_trade(asset_type, symbol, signal, entry_price, tp_pips, sl_pips, volume, atr)
+
+# Modified enhanced_main_loop to incorporate user profile
+def enhanced_main_loop():
+    """Enhanced main loop with user profile integration"""
+    global running
+    
+    # User setup
+    print("Starting ENHANCED trading system with user profiling...")
+    user_profile = enhanced_user_setup()
+    
+    # Apply user preferences
+    apply_scalping_adjustments(user_profile)
+    cleanup_old_data(user_profile)
+    
+    # Update global balance with user's balance
+    save_account_state(user_profile.balance, 0, 0, 0.0)
+    
+    # Initialize data streams and models (existing code)
+    for path in CSV_FILES.values():
+        if not os.path.exists(path):
+            print(f"Creating empty CSV: {path}")
+            # ... (existing CSV creation code)
+    
+    print("Starting data streams...")
+    print("Loading sentiment data...")
+    sentiment_df = load_sentiment_data()
+    sentiment_df = refresh_sentiment()
+    
+    print("Initial training models...")
+    models = {}
+    feature_columns = {}
+    for asset_type in ['crypto', 'stocks', 'forex']:
+        model, cols = train_model_from_data(asset_type, sentiment_df)
+        if model:
+            models[asset_type] = model
+            feature_columns[asset_type] = cols
+            print(f" Initial {asset_type} model trained with {len(cols)} features")
+        else:
+            print(f"Skipping {asset_type} model (no data).")
+    
+    balance, total_trades, wins, total_pnl = load_account_state()
+    print(f"Account loaded: Balance ${balance:.2f}")
+    
+    last_sentiment_refresh = time.time()
+    print("Enhanced main loop starting with user profile...")
+    
+    try:
+        while running:
+            # System health check
+            if not perform_system_health_check():
+                print(" System health check failed - activating emergency stop")
+                circuit_breaker.emergency_stop_trading()
+                break
+            
+            # Market condition check
+            market_ok, market_reason = circuit_breaker.market_condition_check()
+            if not market_ok:
+                print(f" Market conditions not optimal: {market_reason}")
+                time.sleep(300)
+                continue
+            
+            # Refresh sentiment
+            if time.time() - last_sentiment_refresh > 14400:
+                print("Refreshing sentiment...")
+                sentiment_df = refresh_sentiment()
+                last_sentiment_refresh = time.time()
+            
+            # Incremental learning
+            print(" Updating models with latest data...")
+            for asset_type in ['crypto', 'stocks', 'forex']:
+                if asset_type in models:
+                    models, feature_columns = incremental_model_update(
+                        models, feature_columns, asset_type, sentiment_df
+                    )
+            
+            # Trade management
+            prices = get_latest_prices()
+            run_exit_checks(prices)
+            check_trade_timeouts(prices)
+            
+            if AUTO_RESET_TRADES:
+                if not hasattr(enhanced_main_loop, '_last_reset'):
+                    enhanced_main_loop._last_reset = 0
+                if time.time() - enhanced_main_loop._last_reset >= AUTO_RESET_INTERVAL:
+                    enhanced_main_loop._last_reset = time.time()
+                    try:
+                        auto_reset_open_trades(prices)
+                    except Exception as e:
+                        print(f"Auto-reset error: {e}")
+            
+            # Daily reset
+            current_time = datetime.now()
+            if current_time.hour == 9 and current_time.minute == 30:
+                risk_manager.reset_daily()
+                print(" Daily counters reset")
+            
+            balance, _, _, _ = load_account_state()
+            
+            # Trading logic with user profile
+            for asset_type in ['crypto', 'stocks', 'forex']:
+                model = models.get(asset_type)
+                cols = feature_columns.get(asset_type)
+                
+                if not model or not cols or not prices.get(asset_type):
+                    continue
+                
+                latest_item = prices[asset_type][0] if prices[asset_type] else None
+                if not latest_item:
+                    continue
+                
+                current_price = latest_item.get('price') or latest_item.get('rate')
+                symbol = latest_item.get('symbol') or latest_item.get('ticker' if asset_type == 'stocks' else 'pair')
+                
+                if not current_price or not symbol:
+                    continue
+                
+                if asset_type == 'forex':
+                    should_trade, reason = should_trade_forex(symbol, model, cols, sentiment_df, current_price)
+                    if not should_trade:
+                        print(f"Skipping {symbol}: {reason}")
+                        continue
+                
+                signal, prob_up, prob_down, tp_pips, sl_pips, _, atr = generate_signal(
+                    model, cols, sentiment_df, asset_type, current_price, symbol
+                )
+                
+                if signal in ["BUY", "SELL"] and tp_pips is not None and sl_pips is not None:
+                    volume = calculate_position_size(asset_type, signal, current_price, sl_pips, balance, symbol)
+                    
+                    if volume > 0:
+                        # Use enhanced execution with user approval
+                        trade = execute_trade_with_approval(
+                            asset_type, symbol, signal, current_price, 
+                            tp_pips, sl_pips, volume, atr, user_profile
+                        )
+                        if trade:
+                            print(f"Executed {signal} for {symbol}")
+            
+            # Daily report
+            if datetime.now().hour == 16 and datetime.now().minute == 0:
+                performance_monitor.generate_daily_report()
+            
+            # Dashboard
+            display_dashboard(models, feature_columns, sentiment_df)
+            
+            time.sleep(60)
+            
+    except KeyboardInterrupt:
+        print("\n Shutdown requested by user...")
+    except Exception as e:
+        print(f" Critical error in main loop: {e}")
+        import traceback
+        traceback.print_exc()
+        circuit_breaker.emergency_stop_trading()
+        performance_monitor.generate_daily_report()
+    finally:
+        running = False
+        balance, total_trades, wins, total_pnl = load_account_state()
+        save_account_state(balance, total_trades, wins, total_pnl)
+        print(" Final account state saved")
+        print(" Enhanced trading system shutdown complete")
 
 
 
@@ -2336,7 +3030,8 @@ def enhanced_main_loop():
     
     try:
         while running:  
-            
+            #user 
+
             if not perform_system_health_check():
                 print(" System health check failed - activating emergency stop")
                 circuit_breaker.emergency_stop_trading()
@@ -2368,7 +3063,7 @@ def enhanced_main_loop():
             
             prices = get_latest_prices()
             run_exit_checks(prices)
-
+            check_trade_timeouts(prices)
             
             if AUTO_RESET_TRADES:
                 
@@ -2389,7 +3084,6 @@ def enhanced_main_loop():
             
             
             balance, _, _, _ = load_account_state()  
-            
             for asset_type in ['crypto', 'stocks', 'forex']:
                 model = models.get(asset_type)
                 cols = feature_columns.get(asset_type)
@@ -2397,7 +3091,6 @@ def enhanced_main_loop():
                 if not model or not cols or not prices.get(asset_type):
                     continue
                     
-                
                 latest_item = prices[asset_type][0] if prices[asset_type] else None
                 if not latest_item:
                     continue
@@ -2408,6 +3101,11 @@ def enhanced_main_loop():
                 if not current_price or not symbol:
                     continue
                 
+                if asset_type == 'forex':
+                    should_trade, reason = should_trade_forex(symbol, model, cols, sentiment_df, current_price)
+                    if not should_trade:
+                        print(f"Skipping {symbol}: {reason}")
+                        continue
                 
                 signal, prob_up, prob_down, tp_pips, sl_pips, _, atr = generate_signal(
                     model, cols, sentiment_df, asset_type, current_price, symbol
@@ -2417,11 +3115,9 @@ def enhanced_main_loop():
                     volume = calculate_position_size(asset_type, signal, current_price, sl_pips, balance, symbol)
                     
                     if volume > 0:
-                        
                         trade = execute_trade(asset_type, symbol, signal, current_price, tp_pips, sl_pips, volume, atr)
                         if trade:
-                            print(f" Auto-executed {signal} for {symbol}")
-            
+                            print(f"Auto-executed {signal} for {symbol}")
             
             if datetime.now().hour == 16 and datetime.now().minute == 0:
                 performance_monitor.generate_daily_report()
@@ -2499,13 +3195,492 @@ def perform_system_health_check():
 
 
 
-if __name__ == "__main__":
+# Add this enhanced user interaction system above the enhanced_main_loop function
+
+class UserTradingProfile:
+    def __init__(self):
+        self.balance = ACCOUNT_BALANCE_START
+        self.profit_target_percent = 5.0
+        self.loss_target_percent = 2.0
+        self.risk_level = "medium"  # low, medium, high
+        self.trading_style = "standard"  # standard, scalping
+        self.manual_approval = True
+        self.approved_trades = []
+        self.delete_history = False
+        self.scalping_duration = 5  # minutes for scalping trades
+        self.position_sizes = {
+            "low": 0.5,    # 0.5% risk per trade
+            "medium": 1.0, # 1.0% risk per trade  
+            "high": 2.0    # 2.0% risk per trade
+        }
     
-    running = True
+    def calculate_dynamic_risk(self):
+        """Calculate risk parameters based on user profile"""
+        risk_multiplier = {
+            "low": 0.5,
+            "medium": 1.0,
+            "high": 1.5
+        }
+        return risk_multiplier.get(self.risk_level, 1.0)
+
+def enhanced_user_setup():
+    """Comprehensive user setup with risk profiling"""
+    profile = UserTradingProfile()
     
+    print("\n" + "="*60)
+    print("ENHANCED TRADING PROFILE SETUP")
+    print("="*60)
+    
+    # Account Balance
+    while True:
+        try:
+            balance_input = input("\nEnter your account balance ($): ").strip()
+            if not balance_input:
+                print("Using default balance: $10,000")
+                profile.balance = ACCOUNT_BALANCE_START
+                break
+            profile.balance = float(balance_input)
+            if profile.balance <= 0:
+                print("Please enter a positive balance.")
+                continue
+            if profile.balance < 100:
+                print("Warning: Balance below $100 may limit trading opportunities.")
+            break
+        except ValueError:
+            print("Invalid input. Please enter a numeric value.")
+    
+    # Profit Target
+    while True:
+        try:
+            profit_input = input("\nEnter your desired profit target (% per month): ").strip()
+            if not profit_input:
+                print("Using default: 5% monthly target")
+                profile.profit_target_percent = 5.0
+                break
+            profile.profit_target_percent = float(profit_input)
+            if profile.profit_target_percent <= 0:
+                print("Please enter a positive target.")
+                continue
+            if profile.profit_target_percent > 50:
+                print("Warning: Target above 50% is very aggressive.")
+            break
+        except ValueError:
+            print("Invalid input. Please enter a numeric value.")
+    
+    # Loss Tolerance
+    while True:
+        try:
+            loss_input = input("\nEnter your maximum acceptable loss (% of account): ").strip()
+            if not loss_input:
+                print("Using default: 2% maximum loss")
+                profile.loss_target_percent = 2.0
+                break
+            profile.loss_target_percent = float(loss_input)
+            if profile.loss_target_percent <= 0:
+                print("Please enter a positive value.")
+                continue
+            if profile.loss_target_percent > 25:
+                print("Warning: Loss tolerance above 25% is extremely high risk.")
+            break
+        except ValueError:
+            print("Invalid input. Please enter a numeric value.")
+    
+    # Risk Level
+    print("\nSelect your risk level:")
+    print("1. LOW (Conservative) - 0.5% risk per trade")
+    print("2. MEDIUM (Balanced) - 1.0% risk per trade") 
+    print("3. HIGH (Aggressive) - 2.0% risk per trade")
+    
+    while True:
+        risk_choice = input("\nEnter choice (1-3): ").strip()
+        if risk_choice == "1":
+            profile.risk_level = "low"
+            break
+        elif risk_choice == "2":
+            profile.risk_level = "medium" 
+            break
+        elif risk_choice == "3":
+            profile.risk_level = "high"
+            break
+        elif not risk_choice:
+            profile.risk_level = "medium"
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    # Trading Style
+    print("\nSelect your trading style:")
+    print("1. STANDARD (4-hour max trades)")
+    print("2. SCALPING (5-minute max trades)")
+    
+    while True:
+        style_choice = input("\nEnter choice (1-2): ").strip()
+        if style_choice == "1":
+            profile.trading_style = "standard"
+            break
+        elif style_choice == "2":
+            profile.trading_style = "scalping"
+            # Adjust parameters for scalping
+            global MAX_TRADE_DURATION_HOURS
+            MAX_TRADE_DURATION_HOURS = 0.083  # 5 minutes in hours
+            print("Scalping mode activated: 5-minute trade duration")
+            break
+        elif not style_choice:
+            profile.trading_style = "standard"
+            break
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+    
+    # Manual Approval
+    while True:
+        approval_input = input("\nRequire manual trade approval? (yes/no): ").strip().lower()
+        if approval_input in ['yes', 'y']:
+            profile.manual_approval = True
+            break
+        elif approval_input in ['no', 'n']:
+            profile.manual_approval = False
+            break
+        elif not approval_input:
+            profile.manual_approval = True
+            break
+        else:
+            print("Please enter 'yes' or 'no'.")
+    
+    # Pre-approved Trades
+    if profile.manual_approval:
+        print("\n=== PRE-APPROVED TRADES SETUP ===")
+        print("Enter symbols you want to pre-approve (comma-separated):")
+        print("Examples: BTCUSDT, AAPL, EUR/USD")
+        print("Leave empty for no pre-approvals")
+        
+        approved_input = input("\nPre-approved symbols: ").strip()
+        if approved_input:
+            profile.approved_trades = [symbol.strip().upper() for symbol in approved_input.split(',')]
+            print(f"Pre-approved trades: {', '.join(profile.approved_trades)}")
+    
+    # Delete History
+    while True:
+        history_input = input("\nDelete existing trade history? (yes/no): ").strip().lower()
+        if history_input in ['yes', 'y']:
+            profile.delete_history = True
+            break
+        elif history_input in ['no', 'n']:
+            profile.delete_history = False
+            break
+        elif not history_input:
+            profile.delete_history = False
+            break
+        else:
+            print("Please enter 'yes' or 'no'.")
+    
+    # Apply risk settings
+    global RISK_PER_TRADE
+    RISK_PER_TRADE = profile.position_sizes[profile.risk_level] / 100.0
+    
+    # Summary
+    print("\n" + "="*60)
+    print("PROFILE SUMMARY")
+    print("="*60)
+    print(f"Account Balance: ${profile.balance:,.2f}")
+    print(f"Monthly Target: {profile.profit_target_percent}%")
+    print(f"Max Loss Tolerance: {profile.loss_target_percent}%")
+    print(f"Risk Level: {profile.risk_level.upper()}")
+    print(f"Risk per Trade: {profile.position_sizes[profile.risk_level]}%")
+    print(f"Trading Style: {profile.trading_style.upper()}")
+    print(f"Manual Approval: {'YES' if profile.manual_approval else 'NO'}")
+    print(f"Pre-approved Symbols: {', '.join(profile.approved_trades) if profile.approved_trades else 'None'}")
+    print(f"Delete History: {'YES' if profile.delete_history else 'NO'}")
+    print("="*60)
+    
+    # Final confirmation
+    while True:
+        confirm = input("\nStart trading with these settings? (yes/no): ").strip().lower()
+        if confirm in ['yes', 'y']:
+            break
+        elif confirm in ['no', 'n']:
+            print("Restarting setup...")
+            return enhanced_user_setup()
+        else:
+            print("Please enter 'yes' or 'no'.")
+    
+    return profile
+
+def request_trade_approval(trade_signal, profile):
+    """Request user approval for a trade with detailed information"""
+    if not profile.manual_approval:
+        return True
+        
+    symbol = trade_signal['symbol']
+    
+    # Auto-approve if symbol is pre-approved
+    if symbol in profile.approved_trades:
+        print(f"✓ Auto-approved {symbol} (pre-approved)")
+        return True
+    
+    print(f"\n🔔 TRADE APPROVAL REQUESTED")
+    print("="*50)
+    print(f"SYMBOL: {symbol}")
+    print(f"SIGNAL: {trade_signal['signal']}")
+    print(f"ENTRY: {trade_signal['entry_price']:.5f}")
+    print(f"TP: {trade_signal['tp_price']:.5f}")
+    print(f"SL: {trade_signal['sl_price']:.5f}")
+    print(f"VOLUME: {trade_signal['volume']}")
+    print(f"RISK: ${trade_signal['risk_amount']:.2f}")
+    print(f"CONFIDENCE: {trade_signal['confidence']:.1%}")
+    print("="*50)
+    
+    while True:
+        approval = input("Approve this trade? (yes/no/skip): ").strip().lower()
+        if approval in ['yes', 'y']:
+            print("✓ Trade approved!")
+            return True
+        elif approval in ['no', 'n']:
+            print("✗ Trade rejected.")
+            return False
+        elif approval in ['skip', 's']:
+            print("⏭️ Trade skipped.")
+            return False
+        else:
+            print("Please enter 'yes', 'no', or 'skip'.")
+
+def apply_scalping_adjustments(profile):
+    """Adjust trading parameters for scalping mode"""
+    if profile.trading_style == "scalping":
+        # Tighter stops for scalping
+        global ATR_MULTIPLIER_SL, REWARD_RISK_RATIO, MIN_SL_PIPS
+        ATR_MULTIPLIER_SL = 1.0  # Tighter stops
+        REWARD_RISK_RATIO = 1.5  # Lower reward:risk for quicker trades
+        MIN_SL_PIPS = 5  # Smaller minimum stop loss
+        
+        print("Scalping adjustments applied:")
+        print(f"  - Tighter stops (ATR Multiplier: {ATR_MULTIPLIER_SL})")
+        print(f"  - Lower reward:risk ratio ({REWARD_RISK_RATIO}:1)")
+        print(f"  - Max trade duration: {profile.scalping_duration} minutes")
+
+def cleanup_old_data(profile):
+    """Clean up old data based on user preferences"""
+    if profile.delete_history:
+        files_to_clean = [TRADE_HISTORY_FILE, TRADE_FILE, ACCOUNT_STATE_FILE]
+        for file_path in files_to_clean:
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted: {file_path}")
+                except Exception as e:
+                    print(f"Error deleting {file_path}: {e}")
+        
+        # Reset account state
+        save_account_state(profile.balance, 0, 0, 0.0)
+        print("Trade history cleared and account reset.")
+
+# Enhanced trade execution with user approval
+def execute_trade_with_approval(asset_type, symbol, signal, entry_price, tp_pips, sl_pips, volume, atr, profile):
+    """Enhanced trade execution with user approval system"""
+    
+    # Calculate trade details
+    pair_info = get_pair_info(symbol) if asset_type == 'forex' else {"pip_value": PIP_VALUE_DEFAULT}
+    pip_value = pair_info['pip_value']
+    
+    sl_distance = sl_pips * pip_value
+    tp_distance = tp_pips * pip_value
+    
+    if signal == "BUY":
+        sl_price = entry_price - sl_distance
+        tp_price = entry_price + tp_distance
+    else:  # SELL
+        sl_price = entry_price + sl_distance
+        tp_price = entry_price - tp_distance
+    
+    risk_amount = volume * sl_distance
+    
+    # Get model confidence
+    latest_features, _ = get_latest_features(asset_type, load_sentiment_data())
+    confidence = max(latest_features.get('RSI', 0.5) / 100.0, 0.5)  # Simplified confidence
+    
+    trade_signal = {
+        'symbol': symbol,
+        'signal': signal,
+        'entry_price': entry_price,
+        'tp_price': tp_price,
+        'sl_price': sl_price,
+        'volume': volume,
+        'risk_amount': risk_amount,
+        'confidence': confidence,
+        'asset_type': asset_type
+    }
+    
+    # Request approval
+    if not request_trade_approval(trade_signal, profile):
+        return None
+    
+    # Execute the trade
+    return execute_trade(asset_type, symbol, signal, entry_price, tp_pips, sl_pips, volume, atr)
+
+# Modified enhanced_main_loop to incorporate user profile
+def enhanced_main_loop():
+    """Enhanced main loop with user profile integration"""
+    global running
+    
+    # User setup
+    print("Starting ENHANCED trading system with user profiling...")
+    user_profile = enhanced_user_setup()
+    
+    # Apply user preferences
+    apply_scalping_adjustments(user_profile)
+    cleanup_old_data(user_profile)
+    
+    # Update global balance with user's balance
+    save_account_state(user_profile.balance, 0, 0, 0.0)
+    
+    # Initialize data streams and models (existing code)
+    for path in CSV_FILES.values():
+        if not os.path.exists(path):
+            print(f"Creating empty CSV: {path}")
+            # ... (existing CSV creation code)
     
     print("Starting data streams...")
+    print("Loading sentiment data...")
+    sentiment_df = load_sentiment_data()
+    sentiment_df = refresh_sentiment()
     
+    print("Initial training models...")
+    models = {}
+    feature_columns = {}
+    for asset_type in ['crypto', 'stocks', 'forex']:
+        model, cols = train_model_from_data(asset_type, sentiment_df)
+        if model:
+            models[asset_type] = model
+            feature_columns[asset_type] = cols
+            print(f" Initial {asset_type} model trained with {len(cols)} features")
+        else:
+            print(f"Skipping {asset_type} model (no data).")
+    
+    balance, total_trades, wins, total_pnl = load_account_state()
+    print(f"Account loaded: Balance ${balance:.2f}")
+    
+    last_sentiment_refresh = time.time()
+    print("Enhanced main loop starting with user profile...")
+    
+    try:
+        while running:
+            # System health check
+            if not perform_system_health_check():
+                print(" System health check failed - activating emergency stop")
+                circuit_breaker.emergency_stop_trading()
+                break
+            
+            # Market condition check
+            market_ok, market_reason = circuit_breaker.market_condition_check()
+            if not market_ok:
+                print(f" Market conditions not optimal: {market_reason}")
+                time.sleep(300)
+                continue
+            
+            # Refresh sentiment
+            if time.time() - last_sentiment_refresh > 14400:
+                print("Refreshing sentiment...")
+                sentiment_df = refresh_sentiment()
+                last_sentiment_refresh = time.time()
+            
+            # Incremental learning
+            print(" Updating models with latest data...")
+            for asset_type in ['crypto', 'stocks', 'forex']:
+                if asset_type in models:
+                    models, feature_columns = incremental_model_update(
+                        models, feature_columns, asset_type, sentiment_df
+                    )
+            
+            # Trade management
+            prices = get_latest_prices()
+            run_exit_checks(prices)
+            check_trade_timeouts(prices)
+            
+            if AUTO_RESET_TRADES:
+                if not hasattr(enhanced_main_loop, '_last_reset'):
+                    enhanced_main_loop._last_reset = 0
+                if time.time() - enhanced_main_loop._last_reset >= AUTO_RESET_INTERVAL:
+                    enhanced_main_loop._last_reset = time.time()
+                    try:
+                        auto_reset_open_trades(prices)
+                    except Exception as e:
+                        print(f"Auto-reset error: {e}")
+            
+            # Daily reset
+            current_time = datetime.now()
+            if current_time.hour == 9 and current_time.minute == 30:
+                risk_manager.reset_daily()
+                print(" Daily counters reset")
+            
+            balance, _, _, _ = load_account_state()
+            
+            # Trading logic with user profile
+            for asset_type in ['crypto', 'stocks', 'forex']:
+                model = models.get(asset_type)
+                cols = feature_columns.get(asset_type)
+                
+                if not model or not cols or not prices.get(asset_type):
+                    continue
+                
+                latest_item = prices[asset_type][0] if prices[asset_type] else None
+                if not latest_item:
+                    continue
+                
+                current_price = latest_item.get('price') or latest_item.get('rate')
+                symbol = latest_item.get('symbol') or latest_item.get('ticker' if asset_type == 'stocks' else 'pair')
+                
+                if not current_price or not symbol:
+                    continue
+                
+                if asset_type == 'forex':
+                    should_trade, reason = should_trade_forex(symbol, model, cols, sentiment_df, current_price)
+                    if not should_trade:
+                        print(f"Skipping {symbol}: {reason}")
+                        continue
+                
+                signal, prob_up, prob_down, tp_pips, sl_pips, _, atr = generate_signal(
+                    model, cols, sentiment_df, asset_type, current_price, symbol
+                )
+                
+                if signal in ["BUY", "SELL"] and tp_pips is not None and sl_pips is not None:
+                    volume = calculate_position_size(asset_type, signal, current_price, sl_pips, balance, symbol)
+                    
+                    if volume > 0:
+                        # Use enhanced execution with user approval
+                        trade = execute_trade_with_approval(
+                            asset_type, symbol, signal, current_price, 
+                            tp_pips, sl_pips, volume, atr, user_profile
+                        )
+                        if trade:
+                            print(f"Executed {signal} for {symbol}")
+            
+            # Daily report
+            if datetime.now().hour == 16 and datetime.now().minute == 0:
+                performance_monitor.generate_daily_report()
+            
+            # Dashboard
+            display_dashboard(models, feature_columns, sentiment_df)
+            
+            time.sleep(60)
+            
+    except KeyboardInterrupt:
+        print("\n Shutdown requested by user...")
+    except Exception as e:
+        print(f" Critical error in main loop: {e}")
+        import traceback
+        traceback.print_exc()
+        circuit_breaker.emergency_stop_trading()
+        performance_monitor.generate_daily_report()
+    finally:
+        running = False
+        balance, total_trades, wins, total_pnl = load_account_state()
+        save_account_state(balance, total_trades, wins, total_pnl)
+        print(" Final account state saved")
+        print(" Enhanced trading system shutdown complete")
+
+
+if __name__ == "__main__":
+    running = True
+    print("Starting ENHANCED Trading System with User Profiling...")
     
     try:
         enhanced_main_loop()
